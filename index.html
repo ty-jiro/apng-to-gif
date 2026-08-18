@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APNG to GIF converter</title>
+<style>
+  body{
+    font-family:sans-serif;
+    max-width:700px;
+    margin:20px auto;
+    padding:0 15px;
+    line-height:1.4;
+  }
+  h1{font-size:20px; margin-bottom:4px;}
+  p.sub{color:#555; margin-top:0; font-size:14px;}
+  #drop{
+    border:2px dashed #999;
+    padding:30px;
+    text-align:center;
+    cursor:pointer;
+    margin:15px 0;
+  }
+  #drop.drag{border-color:#333; background:#f4f4f4;}
+  input[type=file]{display:none;}
+
+  fieldset{margin:15px 0;}
+  .controls{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:10px 20px;
+  }
+  .field{margin-bottom:8px;}
+  .field label{display:block; font-size:13px; margin-bottom:3px;}
+  .field input[type=range]{width:100%;}
+  select, input[type=number]{width:100%;}
+
+  button{
+    padding:10px 16px;
+    font-size:14px;
+    cursor:pointer;
+  }
+  button:disabled{cursor:not-allowed; opacity:0.6;}
+
+  table{
+    width:100%;
+    border-collapse:collapse;
+    margin-top:20px;
+  }
+  th, td{
+    text-align:left;
+    border-bottom:1px solid #ddd;
+    padding:6px 8px;
+    font-size:13px;
+    vertical-align:middle;
+  }
+  td.thumb img{
+    max-width:48px; max-height:48px;
+    display:block;
+  }
+  .status-error{color:#b00;}
+  .status-done{color:#080;}
+  progress{width:100px;}
+
+  #error{
+    display:none;
+    color:#b00;
+    border:1px solid #b00;
+    padding:10px;
+    margin-top:15px;
+    font-size:13px;
+  }
+</style>
+</head>
+<body>
+
+<h1>APNG to GIF converter</h1>
+<p class="sub">Runs entirely in your browser. Drop one or more APNG files below.</p>
+
+<div id="drop">
+  Drop files here, or click to choose (multiple allowed)
+  <input type="file" id="fileInput" accept=".png,.apng,image/png" multiple>
+</div>
+
+<fieldset>
+  <legend>Options (applied to all files)</legend>
+  <div class="controls">
+    <div class="field">
+      <label for="quality">Quality (1=best/slowest, 30=worst/fastest): <span id="qualityVal">10</span></label>
+      <input type="range" id="quality" min="1" max="30" value="10">
+    </div>
+    <div class="field">
+      <label for="scale">Resize: <span id="scaleVal">100%</span></label>
+      <input type="range" id="scale" min="10" max="100" value="100" step="5">
+    </div>
+    <div class="field">
+      <label for="delayMode">Frame delay</label>
+      <select id="delayMode">
+        <option value="source">Use source timing</option>
+        <option value="fixed">Fixed delay</option>
+      </select>
+    </div>
+    <div class="field" id="fixedDelayField" style="display:none;">
+      <label for="fixedDelay">Delay (ms)</label>
+      <input type="number" id="fixedDelay" value="100" min="20" step="10">
+    </div>
+    <div class="field">
+      <label for="bgColor">Background (used where PNG is transparent)</label>
+      <input type="color" id="bgColor" value="#ffffff">
+    </div>
+    <div class="field">
+      <label><input type="checkbox" id="autoTransparent" checked> Make that background color transparent in the GIF</label>
+    </div>
+    <div class="field">
+      <label for="loopMode">Loop</label>
+      <select id="loopMode">
+        <option value="0">Loop forever</option>
+        <option value="-1">Play once</option>
+      </select>
+    </div>
+  </div>
+</fieldset>
+
+<button id="convertBtn" disabled>Choose files first</button>
+<span id="overallStatus"></span>
+
+<div id="error"></div>
+
+<table id="fileTable" style="display:none;">
+  <thead>
+    <tr><th></th><th>File</th><th>Info</th><th>Status</th><th>Download</th></tr>
+  </thead>
+  <tbody id="fileTableBody"></tbody>
+</table>
+
+<script src="https://cdn.jsdelivr.net/npm/pako@1.0.11/dist/pako.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/upng-js@2.1.0/UPNG.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"></script>
+<script>
+(function(){
+  const drop = document.getElementById('drop');
+  const fileInput = document.getElementById('fileInput');
+  const convertBtn = document.getElementById('convertBtn');
+  const overallStatus = document.getElementById('overallStatus');
+  const qualityInput = document.getElementById('quality');
+  const qualityVal = document.getElementById('qualityVal');
+  const scaleInput = document.getElementById('scale');
+  const scaleVal = document.getElementById('scaleVal');
+  const delayMode = document.getElementById('delayMode');
+  const fixedDelayField = document.getElementById('fixedDelayField');
+  const fixedDelay = document.getElementById('fixedDelay');
+  const bgColor = document.getElementById('bgColor');
+  const autoTransparent = document.getElementById('autoTransparent');
+  const loopMode = document.getElementById('loopMode');
+  const errorBox = document.getElementById('error');
+  const fileTable = document.getElementById('fileTable');
+  const fileTableBody = document.getElementById('fileTableBody');
+
+  let queue = []; // { file, thumbCell, infoCell, statusCell, downloadCell }
+
+  qualityInput.addEventListener('input', () => qualityVal.textContent = qualityInput.value);
+  scaleInput.addEventListener('input', () => scaleVal.textContent = scaleInput.value + '%');
+  delayMode.addEventListener('change', () => {
+    fixedDelayField.style.display = delayMode.value === 'fixed' ? 'block' : 'none';
+  });
+
+  function showError(msg){
+    errorBox.textContent = msg;
+    errorBox.style.display = 'block';
+  }
+  function clearError(){
+    errorBox.style.display = 'none';
+    errorBox.textContent = '';
+  }
+
+  ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.add('drag');
+  }));
+  ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.remove('drag');
+  }));
+  drop.addEventListener('drop', e => {
+    if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
+  drop.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) addFiles(fileInput.files);
+    fileInput.value = ''; // allow re-adding same file later
+  });
+
+  function addFiles(fileList){
+    clearError();
+    const files = Array.from(fileList).filter(f => /png$/i.test(f.name) || f.type === 'image/png');
+    if (!files.length){
+      showError('No .png/.apng files found in what you dropped.');
+      return;
+    }
+    files.forEach(file => {
+      const tr = document.createElement('tr');
+      const thumbCell = document.createElement('td');
+      thumbCell.className = 'thumb';
+      const nameCell = document.createElement('td');
+      nameCell.textContent = file.name;
+      const infoCell = document.createElement('td');
+      infoCell.textContent = '—';
+      const statusCell = document.createElement('td');
+      statusCell.textContent = 'Queued';
+      const downloadCell = document.createElement('td');
+      tr.appendChild(thumbCell);
+      tr.appendChild(nameCell);
+      tr.appendChild(infoCell);
+      tr.appendChild(statusCell);
+      tr.appendChild(downloadCell);
+      fileTableBody.appendChild(tr);
+
+      queue.push({
+        file: file,
+        thumbCell: thumbCell,
+        infoCell: infoCell,
+        statusCell: statusCell,
+        downloadCell: downloadCell
+      });
+    });
+    fileTable.style.display = queue.length ? 'table' : 'none';
+    convertBtn.disabled = false;
+    convertBtn.textContent = `Convert ${queue.length} file${queue.length===1?'':'s'} to GIF`;
+  }
+
+  convertBtn.addEventListener('click', async () => {
+    clearError();
+    convertBtn.disabled = true;
+    const total = queue.length;
+    let done = 0, failed = 0;
+
+    for (const item of queue){
+      if (item.statusCell.classList.contains('status-done')){ done++; continue; }
+      try {
+        await convertOne(item);
+        done++;
+      } catch(err){
+        console.error(err);
+        item.statusCell.textContent = 'Error: ' + err.message;
+        item.statusCell.className = 'status-error';
+        failed++;
+      }
+      overallStatus.textContent = ` ${done}/${total} done${failed ? ', ' + failed + ' failed' : ''}`;
+    }
+
+    convertBtn.disabled = false;
+    convertBtn.textContent = `Convert ${queue.length} file${queue.length===1?'':'s'} to GIF`;
+    overallStatus.textContent = ` All done: ${done - failed}/${total} succeeded${failed ? ', ' + failed + ' failed' : ''}`;
+  });
+
+  function convertOne(item){
+    return new Promise((resolve, reject) => {
+      item.statusCell.textContent = 'Reading…';
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('could not read file'));
+      reader.onload = () => {
+        let decoded;
+        try {
+          const img = UPNG.decode(reader.result);
+          const rgbaFrames = UPNG.toRGBA8(img);
+          const delays = (img.frames && img.frames.length)
+            ? img.frames.map(f => (f.delay && f.delay > 0) ? f.delay : 100)
+            : [100];
+          decoded = { width: img.width, height: img.height, rgbaFrames, delays };
+        } catch(err){
+          reject(new Error('decode failed: ' + err.message));
+          return;
+        }
+
+        // thumbnail from first frame (best-effort)
+        try {
+          const c = document.createElement('canvas');
+          c.width = decoded.width; c.height = decoded.height;
+          const ctx = c.getContext('2d');
+          ctx.putImageData(new ImageData(new Uint8ClampedArray(decoded.rgbaFrames[0]), decoded.width, decoded.height), 0, 0);
+          const im = document.createElement('img');
+          im.src = c.toDataURL();
+          item.thumbCell.innerHTML = '';
+          item.thumbCell.appendChild(im);
+        } catch(e){ /* thumbnail failure is non-fatal */ }
+
+        item.infoCell.textContent = `${decoded.width}×${decoded.height}, ${decoded.rgbaFrames.length} frame${decoded.rgbaFrames.length===1?'':'s'}`;
+
+        const scalePct = parseInt(scaleInput.value, 10) / 100;
+        const outW = Math.max(1, Math.round(decoded.width * scalePct));
+        const outH = Math.max(1, Math.round(decoded.height * scalePct));
+        const useFixedDelay = delayMode.value === 'fixed';
+        const fixedMs = Math.max(20, parseInt(fixedDelay.value, 10) || 100);
+        const repeat = parseInt(loopMode.value, 10);
+
+        let gif;
+        try {
+          gif = new GIF({
+            workers: 3,
+            quality: parseInt(qualityInput.value, 10),
+            width: outW,
+            height: outH,
+            workerScript: 'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js',
+            repeat: repeat,
+            transparent: autoTransparent.checked ? bgColor.value : null
+          });
+        } catch(err){
+          reject(new Error('encoder init failed: ' + err.message));
+          return;
+        }
+
+        const progress = document.createElement('progress');
+        progress.max = 1; progress.value = 0;
+        item.statusCell.textContent = '';
+        item.statusCell.appendChild(progress);
+
+        gif.on('progress', p => { progress.value = p; });
+
+        gif.on('finished', blob => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = item.file.name.replace(/\.(a?png)$/i, '') + '.gif';
+          a.textContent = `Download (${(blob.size/1024).toFixed(1)} KB)`;
+          item.downloadCell.innerHTML = '';
+          item.downloadCell.appendChild(a);
+          item.statusCell.textContent = 'Done';
+          item.statusCell.className = 'status-done';
+          resolve();
+        });
+
+        // composite frames (handles transparency + resize)
+        const srcCanvas = document.createElement('canvas');
+        srcCanvas.width = decoded.width; srcCanvas.height = decoded.height;
+        const srcCtx = srcCanvas.getContext('2d');
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = outW; outCanvas.height = outH;
+        const outCtx = outCanvas.getContext('2d');
+
+        try {
+          for (let i = 0; i < decoded.rgbaFrames.length; i++){
+            const imgData = new ImageData(new Uint8ClampedArray(decoded.rgbaFrames[i]), decoded.width, decoded.height);
+            srcCtx.clearRect(0,0,decoded.width,decoded.height);
+            srcCtx.putImageData(imgData, 0, 0);
+
+            outCtx.clearRect(0,0,outW,outH);
+            outCtx.fillStyle = bgColor.value;
+            outCtx.fillRect(0,0,outW,outH);
+            outCtx.drawImage(srcCanvas, 0, 0, outW, outH);
+
+            const delay = useFixedDelay ? fixedMs : decoded.delays[i % decoded.delays.length];
+            gif.addFrame(outCtx, { copy: true, delay: delay });
+          }
+        } catch(err){
+          reject(new Error('compositing failed: ' + err.message));
+          return;
+        }
+
+        gif.render();
+      };
+      reader.readAsArrayBuffer(item.file);
+    });
+  }
+})();
+</script>
+
+</body>
+</html>
